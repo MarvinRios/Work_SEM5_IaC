@@ -1,0 +1,112 @@
+const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+const sharp = require('sharp');
+
+const s3Client = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
+
+const OUTPUT_SIZE = 40; // px
+
+// Máscara SVG circular (transparent background)
+const CIRCLE_MASK_SVG = Buffer.from(
+  `<svg><circle cx="${OUTPUT_SIZE / 2}" cy="${OUTPUT_SIZE / 2}" r="${OUTPUT_SIZE / 2}"/></svg>`
+);
+
+/**
+ * Convierte un stream S3 en Buffer.
+ */
+async function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', (chunk) => chunks.push(chunk));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
+}
+
+/**
+ * Recorta una imagen a 40×40 px con forma circular.
+ * @param {Buffer} inputBuffer - imagen original
+ * @returns {Promise<Buffer>} - PNG 40×40 con canal alpha y fondo transparente
+ */
+async function cropCircular(inputBuffer) {
+  return sharp(inputBuffer)
+    .resize(OUTPUT_SIZE, OUTPUT_SIZE, {
+      fit: 'cover',       // cover: rellena el cuadrado recortando si es necesario
+      position: 'centre', // centra la imagen
+    })
+    .composite([{
+      input: CIRCLE_MASK_SVG,
+      blend: 'dest-in',   // aplica la máscara circular (retiene solo el círculo)
+    }])
+    .png({
+      compressionLevel: 6,  // balance calidad/velocidad
+      adaptiveFiltering: false,
+    })
+    .toBuffer();
+}
+
+
+async function processRecord(record) {
+  let s3Key;
+  try {
+    const sqsBody = JSON.parse(record.body);
+
+    const s3Event = sqsBody.Records?.[0] || sqsBody;
+    s3Key = decodeURIComponent(s3Event.s3?.object?.key?.replace(/\+/g, ' '));
+    const bucketName = s3Event.s3?.bucket?.name || process.env.S3_BUCKET;
+
+    if (!s3Key) throw new Error('No se pudo extraer la clave S3 del mensaje');
+
+    console.log(`[crop] Procesando: s3://${bucketName}/${s3Key}`);
+
+    const getCmd = new GetObjectCommand({ Bucket: bucketName, Key: s3Key });
+    const s3Object = await s3Client.send(getCmd);
+    const inputBuffer = await streamToBuffer(s3Object.Body);
+
+    console.log(`[crop] Descargado: ${inputBuffer.length} bytes`);
+
+    const outputBuffer = await cropCircular(inputBuffer);
+
+    const filename = s3Key.split('/').pop().replace(/\.[^.]+$/, '');
+    const destKey = `${process.env.PROCESSED_PREFIX}${filename}_circular.png`;
+
+    await s3Client.send(new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: destKey,
+      Body: outputBuffer,
+      ContentType: 'image/png',
+    }));
+
+    console.log(`[crop] Guardado: s3://${process.env.S3_BUCKET}/${destKey} (${outputBuffer.length} bytes)`);
+    return null; // éxito
+
+  } catch (err) {
+    console.error(`[crop] Error procesando ${s3Key || 'desconocido'}:`, err.message, err.stack);
+    return record.messageId; // fallo — SQS lo reintentará
+  }
+}
+
+exports.handler = async (event) => {
+  console.log(`[crop] Batch recibido: ${event.Records.length} mensajes`);
+
+  const itemFailures = [];
+
+  const results = await Promise.allSettled(
+    event.Records.map((record) => processRecord(record))
+  );
+
+  results.forEach((result, idx) => {
+    if (result.status === 'rejected' || result.value !== null) {
+      const messageId = result.value || event.Records[idx].messageId;
+      console.error(`[crop] Fallo messageId: ${messageId}`);
+      itemFailures.push({ itemIdentifier: messageId });
+    }
+  });
+
+  if (itemFailures.length > 0) {
+    console.warn(`[crop] ${itemFailures.length} mensajes fallidos de ${event.Records.length}`);
+  } else {
+    console.log(`[crop] Todos los mensajes procesados correctamente`);
+  }
+
+  return { batchItemFailures: itemFailures };
+};
