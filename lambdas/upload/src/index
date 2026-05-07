@@ -1,0 +1,154 @@
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const Busboy = require('busboy');
+const { v4: uuidv4 } = require('uuid');
+
+const s3Client = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
+
+const ALLOWED_TYPES = ['image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp'];
+const MAX_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB
+
+const EXTENSION_MAP = {
+  'image/jpeg': 'jpg',
+  'image/jpg':  'jpg',
+  'image/png':  'png',
+  'image/gif':  'gif',
+  'image/webp': 'webp',
+};
+
+
+function buildResponse(statusCode, body) {
+  return {
+    statusCode,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    },
+    body: JSON.stringify(body),
+  };
+}
+
+
+function parseMultipart(event) {
+  return new Promise((resolve, reject) => {
+    const contentType = event.headers?.['content-type'] || event.headers?.['Content-Type'] || '';
+    const busboy = Busboy({ headers: { 'content-type': contentType } });
+
+    let fileBuffer = null;
+    let fileMimetype = null;
+    let fileSize = 0;
+
+    busboy.on('file', (fieldname, file, info) => {
+      const { mimeType } = info;
+      fileMimetype = mimeType;
+      const chunks = [];
+
+      file.on('data', (chunk) => {
+        fileSize += chunk.length;
+        if (fileSize > MAX_SIZE_BYTES) {
+          file.destroy(new Error('FILE_TOO_LARGE'));
+        } else {
+          chunks.push(chunk);
+        }
+      });
+
+      file.on('close', () => {
+        fileBuffer = Buffer.concat(chunks);
+      });
+
+      file.on('error', reject);
+    });
+
+    busboy.on('finish', () => {
+      if (!fileBuffer) return reject(new Error('NO_FILE'));
+      resolve({ buffer: fileBuffer, mimeType: fileMimetype });
+    });
+
+    busboy.on('error', reject);
+
+    // API Gateway Payload 2.0: body puede venir en base64
+    const body = event.isBase64Encoded
+      ? Buffer.from(event.body, 'base64')
+      : event.body;
+
+    busboy.write(body);
+    busboy.end();
+  });
+}
+
+
+function parseJsonBase64(event) {
+  const body = typeof event.body === 'string' ? JSON.parse(event.body) : event.body;
+  const { image, mimeType } = body;
+  if (!image || !mimeType) throw new Error('NO_FILE');
+  const buffer = Buffer.from(image, 'base64');
+  if (buffer.length > MAX_SIZE_BYTES) throw new Error('FILE_TOO_LARGE');
+  return { buffer, mimeType };
+}
+
+exports.handler = async (event) => {
+  console.log('[upload] Inicio:', JSON.stringify({
+    method: event.requestContext?.http?.method,
+    path: event.requestContext?.http?.path,
+    contentType: event.headers?.['content-type'] || event.headers?.['Content-Type'],
+    env: process.env.ENVIRONMENT,
+  }));
+
+  try {
+    const contentType = (event.headers?.['content-type'] || event.headers?.['Content-Type'] || '').toLowerCase();
+    let buffer, mimeType;
+
+    // Detectar estrategia de parseo
+    if (contentType.includes('multipart/form-data')) {
+      ({ buffer, mimeType } = await parseMultipart(event));
+    } else if (contentType.includes('application/json')) {
+      ({ buffer, mimeType } = parseJsonBase64(event));
+    } else {
+      return buildResponse(415, {
+        error: 'Unsupported Media Type',
+        message: 'Use multipart/form-data o application/json con base64',
+      });
+    }
+
+    // Validar tipo MIME
+    if (!ALLOWED_TYPES.includes(mimeType)) {
+      return buildResponse(400, {
+        error: 'Tipo de archivo no permitido',
+        allowed: ['jpg', 'png', 'gif', 'webp'],
+      });
+    }
+
+    // Generar clave S3
+    const fileId = uuidv4();
+    const extension = EXTENSION_MAP[mimeType] || 'bin';
+    const s3Key = `${process.env.UPLOAD_PREFIX}${fileId}.${extension}`;
+
+    // Subir a S3
+    await s3Client.send(new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: s3Key,
+      Body: buffer,
+      ContentType: mimeType,
+    }));
+
+    console.log('[upload] Éxito:', { s3Key, size: buffer.length, mimeType });
+
+    return buildResponse(200, {
+      message: 'Imagen subida correctamente',
+      fileId,
+      s3Key,
+      size: buffer.length,
+    });
+
+  } catch (err) {
+    console.error('[upload] Error:', err.message, err.stack);
+
+    if (err.message === 'FILE_TOO_LARGE') {
+      return buildResponse(413, { error: 'Archivo demasiado grande. Máximo 10 MB.' });
+    }
+    if (err.message === 'NO_FILE') {
+      return buildResponse(400, { error: 'No se encontró archivo en la solicitud.' });
+    }
+
+    return buildResponse(500, { error: 'Error interno del servidor.' });
+  }
+};
